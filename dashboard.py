@@ -7,17 +7,20 @@ st.set_page_config(
 )
 
 # Custom Styling for modern look
-st.markdown("""
+st.markdown(
+    """
     <style>
     .main { background-color: #0f172a; color: #f8fafc; }
     .stAlert { border-radius: 8px; }
     </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 st.title("🛡️ Kavach-Proxy: Live Enterprise Security Gateway")
 st.markdown(
-    "**Middleware Defense Layer** protecting LLM applications from Prompt"
-    " Injections & Structural Tampering in real-time."
+    "**Middleware Defense Layer** protecting LLM applications from Prompt "
+    "Injections & Structural Tampering in real-time."
 )
 
 # Layout Columns
@@ -29,10 +32,6 @@ with col_left:
       "Test how Kavach-Proxy intercepts user traffic before it reaches the"
       " LLM."
   )
-
-  # Quick Test Buttons for easy demo
-  st.markdown("**Quick Injection Presets:**")
-  preset_col1, preset_col2, preset_col3 = st.columns(3)
 
   sample_prompt = st.text_area(
       "Enter user prompt or untrusted data:",
@@ -65,9 +64,9 @@ with col_left:
         if response.status_code == 200:
           data = response.json()
           decision = data.get("decision", {})
-          action = decision.get("action")
-          score = decision.get("score")
-          reasons = decision.get("reasons", [])
+          action = decision.get("action", "PASS")
+          score = decision.get("risk_score", decision.get("score", 0.0))
+          reasons = decision.get("matches", decision.get("reasons", []))
 
           # Store in session state for live audit feed
           if "history" not in st.session_state:
@@ -83,10 +82,15 @@ with col_left:
           )
 
           # Visual Notification Alerts on UI
-          if action == "block":
+          if action.upper() == "BLOCK":
             st.error(
                 "🚨 **SECURITY ALERT: Prompt Injection Blocked!** Attack pattern"
                 f" detected (Risk Score: {score})"
+            )
+          elif action.upper() == "REDACT":
+            st.warning(
+                "⚠️ **Warning: Content Redacted!** Medium risk detected (Risk"
+                f" Score: {score})"
             )
           else:
             st.success(
@@ -109,10 +113,11 @@ with col_right:
 
   if "history" in st.session_state and st.session_state.history:
     for item in st.session_state.history[:5]:  # show last 5 events
-      status_color = "🔴" if item["action"] == "block" else "🟢"
+      act_upper = item["action"].upper()
+      status_color = "🔴" if act_upper == "BLOCK" else "🟢"
       with st.container():
         st.markdown(f"""
-                **{status_color} Action: `{item['action'].upper()}`** | **Risk Score:** `{item['score']}`
+                **{status_color} Action: `{act_upper}`** | **Risk Score:** `{item['score']}`
                 * *Input:* `{item['prompt'][:60]}...`
                 * *Flags:* `{item['reasons'] if item['reasons'] else 'None'}`
                 ---

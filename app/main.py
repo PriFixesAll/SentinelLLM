@@ -1,6 +1,7 @@
 """Kavach-Proxy FastAPI service: structural sanitization gateway for LLM traffic."""
 
 from __future__ import annotations
+from app.services.classifier import ThreatClassifier
 
 import logging
 import time
