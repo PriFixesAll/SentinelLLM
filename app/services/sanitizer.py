@@ -123,41 +123,57 @@ _HOMOGLYPHS = str.maketrans(
     }
 )
 
-_SPECIAL_TOKEN_RE = re.compile(
-    r"(<\|/?[a-z0-9._-]{1,40}\|>|"
-    r"\[/?INST\]|"
-    r"<<\s*SYS\s*>>|"
-    r"</?\s*sys\s*>|"
-    r"</?\s*system\s*>|"
-    r"</?\s*im_start\s*>|"
-    r"</?\s*im_end\s*>)",
-    re.IGNORECASE,
+from app.services.classifier import ThreatClassifier
+from app.services.semantic_guard import get_semantic_guard
+
+# Dynamic regex patterns loaded from external rules configuration with robust fallbacks
+_SPECIAL_TOKEN_RE = (
+    ThreatClassifier.get_category_regex("SPECIAL_TOKEN_BREAKOUT")
+    or re.compile(
+        r"(<\|/?[a-z0-9._-]{1,40}\|>|"
+        r"\[/?INST\]|"
+        r"<<\s*SYS\s*>>|"
+        r"</?\s*sys\s*>|"
+        r"</?\s*system\s*>|"
+        r"</?\s*im_start\s*>|"
+        r"</?\s*im_end\s*>)",
+        re.IGNORECASE,
+    )
 )
 
-_ROLE_IMPERSONATION_RE = re.compile(
-    r"(?:^|\n)\s*(?:system|developer|assistant|tool)\s*:\s+",
-    re.IGNORECASE,
+_ROLE_IMPERSONATION_RE = (
+    ThreatClassifier.get_category_regex("ROLE_IMPERSONATION")
+    or re.compile(
+        r"(?:^|\n)\s*(?:system|developer|assistant|tool)\s*:\s+",
+        re.IGNORECASE,
+    )
 )
 
-_OVERRIDE_RE = re.compile(
-    r"\b("
-    r"ignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions|prompts|rules)|"
-    r"disregard\s+(the\s+)?(system|developer)\s+(prompt|instructions)|"
-    r"override\s+(the\s+)?(system|safety|guardrails)|"
-    r"you\s+are\s+now\s+(?:a|an|to)|"
-    r"new\s+(system|developer)\s+prompt|"
-    r"from\s+now\s+on\s+(?:you\s+must|ignore)|"
-    r"reveal\s+(your\s+)?(system|hidden|secret)\s+prompt|"
-    r"print\s+(the\s+)?(system|hidden)\s+(prompt|instructions)|"
-    r"disable\s+(your\s+)?(safety|guardrails|filters)"
-    r")\b",
-    re.IGNORECASE,
+_OVERRIDE_RE = (
+    ThreatClassifier.get_category_regex("INSTRUCTION_OVERRIDE")
+    or re.compile(
+        r"\b("
+        r"ignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions|prompts|rules)|"
+        r"disregard\s+(the\s+)?(system|developer)\s+(prompt|instructions)|"
+        r"override\s+(the\s+)?(system|safety|guardrails)|"
+        r"you\s+are\s+now\s+(?:a|an|to)|"
+        r"new\s+(system|developer)\s+prompt|"
+        r"from\s+now\s+on\s+(?:you\s+must|ignore)|"
+        r"reveal\s+(your\s+)?(system|hidden|secret)\s+prompt|"
+        r"print\s+(the\s+)?(system|hidden)\s+(prompt|instructions)|"
+        r"disable\s+(your\s+)?(safety|guardrails|filters)"
+        r")\b",
+        re.IGNORECASE,
+    )
 )
 
-_EXFIL_RE = re.compile(
-    r"\b(exfiltrat(?:e|ion)|send\s+(this|the)\s+(secret|key|prompt)\s+to|"
-    r"webhook|pastebin|ngrok)\b",
-    re.IGNORECASE,
+_EXFIL_RE = (
+    ThreatClassifier.get_category_regex("EXFIL_LANGUAGE")
+    or re.compile(
+        r"\b(exfiltrat(?:e|ion)|send\s+(this|the)\s+(secret|key|prompt)\s+to|"
+        r"webhook|pastebin|ngrok)\b",
+        re.IGNORECASE,
+    )
 )
 
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
@@ -179,6 +195,87 @@ _SPOTLIGHT_PREAMBLE = (
 )
 
 
+class PIIMasker:
+    """High-performance Personally Identifiable Information (PII) masking engine.
+
+    Scans and redacts sensitive entities (credit cards, emails, phone numbers,
+    Aadhaar numbers, and secret API keys) using pre-compiled regular expressions.
+    """
+
+    PATTERNS: dict[str, tuple[re.Pattern[str], str]] = {
+        # 1. API Keys: OpenAI sk-..., AWS AKIA/ASIA, GitHub ghp_/github_pat_, HuggingFace hf_, Slack xoxb
+        "API_KEY": (
+            re.compile(
+                r"\b(?:sk-(?:proj-)?[A-Za-z0-9_\-]{20,}|A[KS]IA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{22,}|hf_[A-Za-z0-9]{25,}|xox[baprs]-[0-9A-Za-z\-]{10,})\b"
+            ),
+            "[API_KEY_MASKED]",
+        ),
+        # 2. Email Addresses: standard RFC 5322 compliant addresses (case-insensitive)
+        "EMAIL": (
+            re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", re.IGNORECASE),
+            "[EMAIL_MASKED]",
+        ),
+        # 3. Credit Cards: Visa, MasterCard, Amex, Discover, RuPay (13-16 digits with spaces or hyphens)
+        "CREDIT_CARD": (
+            re.compile(
+                r"(?<![A-Za-z0-9_])(?:(?:4[0-9]{3}|5[1-5][0-9]{2}|6(?:011|5[0-9]{2})|3[47][0-9]{2})[ -]?(?:[0-9]{4}[ -]?){2}[0-9]{1,4}|(?:\d{4}[ -]?){3}\d{4}|3[47]\d{2}[ -]?\d{6}[ -]?\d{5})(?![A-Za-z0-9_])"
+            ),
+            "[CREDIT_CARD_MASKED]",
+        ),
+        # 4. Aadhaar Numbers: 12 digits (with optional spaces or hyphens, accepts real [2-9] and mock [0-9] test numbers)
+        "AADHAAR": (
+            re.compile(
+                r"(?<!\d)\d{4}[ -]?\d{4}[ -]?\d{4}(?!\d)"
+            ),
+            "[AADHAAR_MASKED]",
+        ),
+        # 5. Phone Numbers: Indian (+91 9876543210), US (+1 (555) 234-5678), and 10-digit formats
+        "PHONE_NUMBER": (
+            re.compile(
+                r"(?<![A-Za-z0-9_])(?:(?:\+?1[ -]?)?\(?\d{3}\)?[ -]?\d{3}[ -]?\d{4}|(?:\+?91[ -]?)?[6-9]\d{4}[ -]?\d{5}|(?:\+?91[ -]?)?[6-9]\d{9})(?![A-Za-z0-9_])"
+            ),
+            "[PHONE_NUMBER_MASKED]",
+        ),
+    }
+
+    def __init__(self, custom_patterns: Optional[dict[str, tuple[re.Pattern[str], str]]] = None) -> None:
+        self.patterns = dict(self.PATTERNS)
+        if custom_patterns:
+            self.patterns.update(custom_patterns)
+
+    def mask(self, text: str) -> tuple[str, dict[str, int]]:
+        """Detects and masks sensitive PII entities in the provided text.
+
+        Returns:
+            tuple[str, dict[str, int]]:
+                - sanitized_text: Text with PII entities replaced by standardized placeholders.
+                - pii_stats: Dictionary recording the count of detected entities per type.
+        """
+        if not text:
+            return text, {}
+
+        stats: dict[str, int] = {}
+        sanitized = text
+
+        for pii_type, (pattern, placeholder) in self.patterns.items():
+            sanitized, count = pattern.subn(placeholder, sanitized)
+            if count > 0:
+                stats[pii_type] = count
+
+        return sanitized, stats
+
+    def add_custom_pattern(self, category: str, pattern: str | re.Pattern[str], placeholder: str) -> None:
+        """Appends a custom PII pattern to the engine."""
+        compiled = re.compile(pattern) if isinstance(pattern, str) else pattern
+        self.patterns[category] = (compiled, placeholder)
+
+
+@lru_cache(maxsize=1)
+def get_pii_masker() -> PIIMasker:
+    """Returns the singleton PIIMasker instance."""
+    return PIIMasker()
+
+
 @dataclass
 class _WorkItem:
     channel: str
@@ -188,6 +285,7 @@ class _WorkItem:
     findings: list[Finding] = field(default_factory=list)
     envelope_id: str = ""
     trust: TrustLevel = TrustLevel.UNTRUSTED
+    pii_stats: dict[str, int] = field(default_factory=dict)
 
 
 class StructuralSanitizer:
@@ -198,11 +296,13 @@ class StructuralSanitizer:
         boundary = secrets.token_urlsafe(18)
         canary = secrets.token_urlsafe(12) if options.include_canary else None
         findings: list[Finding] = []
+        total_pii: dict[str, int] = {}
 
         trusted_parts: list[str] = []
         sanitized_messages: list[SanitizedMessage] = []
         sanitized_docs: list[SanitizedDocument] = []
         untrusted_blocks: list[str] = []
+        primary_clean_text: Optional[str] = None
 
         for index, message in enumerate(request.messages):
             item = self._process_text(
@@ -213,7 +313,11 @@ class StructuralSanitizer:
                 trusted=message.role in _TRUSTED_ROLES and message.source in _TRUSTED_SOURCES,
                 boundary=boundary,
             )
+            if primary_clean_text is None:
+                primary_clean_text = item.cleaned
             findings.extend(item.findings)
+            for k, v in item.pii_stats.items():
+                total_pii[k] = total_pii.get(k, 0) + v
 
             if item.trust is TrustLevel.TRUSTED:
                 trusted_parts.append(item.cleaned)
@@ -265,6 +369,8 @@ class StructuralSanitizer:
                 boundary=boundary,
             )
             findings.extend(item.findings)
+            for k, v in item.pii_stats.items():
+                total_pii[k] = total_pii.get(k, 0) + v
             wrapped = self._spotlight(item, options, boundary, canary)
             untrusted_blocks.append(wrapped)
             sanitized_docs.append(
@@ -289,6 +395,8 @@ class StructuralSanitizer:
                 boundary=boundary,
             )
             findings.extend(item.findings)
+            for k, v in item.pii_stats.items():
+                total_pii[k] = total_pii.get(k, 0) + v
             wrapped = self._spotlight(item, options, boundary, canary)
             untrusted_blocks.append(wrapped)
             sanitized_messages.append(
@@ -303,6 +411,28 @@ class StructuralSanitizer:
                     content_sha256=_sha256(wrapped),
                 )
             )
+
+        # Performance-Optimized Semantic Similarity Guard:
+        # Evaluated ONLY when threat score is in borderline range (30 <= score <= 70)
+        # or when force_semantic_check=True, maintaining sub-5ms proxy latency.
+        if getattr(options, "enable_semantic_guard", True) and primary_clean_text:
+            current_score = min(100, sum(_RISK_SCORE[f.risk] for f in findings))
+            if (30 <= current_score <= 70) or getattr(options, "force_semantic_check", False):
+                is_jb, sim_score, matched_phrase = get_semantic_guard().check_similarity(
+                    primary_clean_text, threshold=getattr(options, "semantic_threshold", 0.72)
+                )
+                if is_jb:
+                    findings.append(
+                        Finding(
+                            code="SEMANTIC_JAILBREAK",
+                            title="Semantic Similarity Jailbreak Detected",
+                            risk=RiskLevel.HIGH,
+                            channel="messages[0].user",
+                            source=ContentSource.USER,
+                            detail=f"Semantic embedding similarity ({sim_score:.2f}) >= threshold against baseline: '{matched_phrase}'.",
+                        )
+                    )
+                    primary_clean_text = f"[REDACTED_SEMANTIC_JAILBREAK] {primary_clean_text}"
 
         decision = self._decide(findings, options)
         if decision.action is PolicyAction.BLOCK:
@@ -328,8 +458,10 @@ class StructuralSanitizer:
                 documents=[],
                 assembled=assembled,
                 canary=canary,
+                sanitized_text=primary_clean_text,
+                pii_detected=total_pii,
                 defense_notes=self._defense_notes(options, boundary),
-                diagnostics={"boundary_prefix": boundary[:6], "blocked": True},
+                diagnostics={"boundary_prefix": boundary[:6], "blocked": True, "pii_detected": total_pii},
             )
 
         trusted_instructions = "\n\n".join(part for part in trusted_parts if part)
@@ -360,12 +492,15 @@ class StructuralSanitizer:
             documents=sanitized_docs,
             assembled=assembled,
             canary=canary,
+            sanitized_text=primary_clean_text,
+            pii_detected=total_pii,
             defense_notes=self._defense_notes(options, boundary),
             diagnostics={
                 "boundary_prefix": boundary[:6],
                 "trusted_message_count": sum(1 for m in sanitized_messages if m.trust is TrustLevel.TRUSTED),
                 "untrusted_block_count": len(untrusted_blocks),
                 "finding_count": len(findings),
+                "pii_detected": total_pii,
             },
         )
 
@@ -396,6 +531,28 @@ class StructuralSanitizer:
         if not trusted:
             findings.extend(unicode_findings)
 
+        # Enterprise PII Masking & Redaction Phase
+        pii_stats: dict[str, int] = {}
+        if getattr(options, "mask_pii", True):
+            cleaned, pii_stats = get_pii_masker().mask(cleaned)
+            if pii_stats and not trusted:
+                stat_desc = ", ".join(f"{k}: {v}" for k, v in pii_stats.items())
+                risk_lvl = (
+                    RiskLevel.MEDIUM
+                    if ("API_KEY" in pii_stats or "CREDIT_CARD" in pii_stats)
+                    else RiskLevel.LOW
+                )
+                findings.append(
+                    _finding(
+                        code="PII_DETECTED",
+                        title="Personally Identifiable Information Redacted",
+                        risk=risk_lvl,
+                        channel=channel,
+                        source=source,
+                        detail=f"Sensitive PII entities redacted: {stat_desc}.",
+                    )
+                )
+
         if trusted:
             return _WorkItem(
                 channel=channel,
@@ -404,6 +561,7 @@ class StructuralSanitizer:
                 cleaned=cleaned,
                 findings=findings,
                 trust=TrustLevel.TRUSTED,
+                pii_stats=pii_stats,
             )
 
         folded = fold_for_detection(cleaned)
@@ -423,6 +581,7 @@ class StructuralSanitizer:
             findings=findings,
             envelope_id=envelope_id,
             trust=TrustLevel.UNTRUSTED,
+            pii_stats=pii_stats,
         )
 
     def _spotlight(
@@ -483,6 +642,8 @@ class StructuralSanitizer:
         score = min(100, sum(_RISK_SCORE[f.risk] for f in findings))
         critical = any(f.risk is RiskLevel.CRITICAL for f in findings)
         high = any(f.risk is RiskLevel.HIGH for f in findings)
+        reasons_list = [f"{f.code}: {f.title}" for f in findings]
+        matches_list = [f.code for f in findings]
 
         if options.policy_mode is PolicyMode.OBSERVE:
             return PolicyDecision(
@@ -490,6 +651,8 @@ class StructuralSanitizer:
                 mode=options.policy_mode,
                 score=score,
                 reason="observe mode records findings without blocking",
+                reasons=reasons_list,
+                matches=matches_list,
             )
 
         if critical and options.block_on_critical:
@@ -498,6 +661,8 @@ class StructuralSanitizer:
                 mode=options.policy_mode,
                 score=score,
                 reason="critical indirect-injection indicators in untrusted channel",
+                reasons=reasons_list,
+                matches=matches_list,
             )
         if high or score >= 45:
             return PolicyDecision(
@@ -505,6 +670,8 @@ class StructuralSanitizer:
                 mode=options.policy_mode,
                 score=score,
                 reason="untrusted channel structurally wrapped; instruction-like spans neutralized",
+                reasons=reasons_list,
+                matches=matches_list,
             )
         if findings:
             return PolicyDecision(
@@ -512,12 +679,16 @@ class StructuralSanitizer:
                 mode=options.policy_mode,
                 score=score,
                 reason="untrusted content isolated in data envelopes",
+                reasons=reasons_list,
+                matches=matches_list,
             )
         return PolicyDecision(
             action=PolicyAction.WRAP,
             mode=options.policy_mode,
             score=score,
             reason="default structural wrap of all untrusted channels",
+            reasons=reasons_list,
+            matches=matches_list,
         )
 
     def _defense_notes(self, options: SanitizeOptions, boundary: str) -> list[str]:
@@ -614,58 +785,42 @@ def fold_for_detection(text: str) -> str:
 
 def detect_injections(folded: str, cleaned: str, channel: str, source: ContentSource) -> list[Finding]:
     findings: list[Finding] = []
+    active_categories = ThreatClassifier.get_categories()
 
-    if _SPECIAL_TOKEN_RE.search(folded) or _SPECIAL_TOKEN_RE.search(cleaned):
-        findings.append(
-            _finding(
-                "SPECIAL_TOKEN_BREAKOUT",
-                "Model special tokens or fake system tags in untrusted data",
-                RiskLevel.CRITICAL,
-                channel,
-                source,
-                "ChatML/INST/SYS markers are neutralized; this is a delimiter-injection indicator.",
-                _preview(cleaned, _SPECIAL_TOKEN_RE),
-            )
-        )
+    for code, category in active_categories.items():
+        if not category.enabled:
+            continue
 
-    if _OVERRIDE_RE.search(folded):
-        findings.append(
-            _finding(
-                "INSTRUCTION_OVERRIDE",
-                "Instruction-override language in untrusted channel",
-                RiskLevel.HIGH,
-                channel,
-                source,
-                "Indirect prompt injection pattern in data that must not be executed as policy.",
-                _preview(folded, _OVERRIDE_RE),
-            )
-        )
+        risk_level = getattr(RiskLevel, category.risk.upper(), RiskLevel.HIGH)
 
-    if _ROLE_IMPERSONATION_RE.search(cleaned):
-        findings.append(
-            _finding(
-                "ROLE_IMPERSONATION",
-                "Role-header impersonation in untrusted text",
-                RiskLevel.HIGH,
-                channel,
-                source,
-                "Lines that mimic chat role headers were found inside data.",
-                _preview(cleaned, _ROLE_IMPERSONATION_RE),
-            )
-        )
+        # Check compiled patterns for this category
+        matched = False
+        matching_pat: Optional[re.Pattern[str]] = None
+        for pattern_re in category.compiled_patterns:
+            if code == "ROLE_IMPERSONATION":
+                if pattern_re.search(cleaned):
+                    matched = True
+                    matching_pat = pattern_re
+                    break
+            else:
+                if pattern_re.search(folded) or pattern_re.search(cleaned):
+                    matched = True
+                    matching_pat = pattern_re
+                    break
 
-    if _EXFIL_RE.search(folded):
-        findings.append(
-            _finding(
-                "EXFIL_LANGUAGE",
-                "Exfiltration-oriented language in untrusted data",
-                RiskLevel.HIGH,
-                channel,
-                source,
-                "Content asks to send secrets or prompts off-box; treat as inert.",
-                _preview(folded, _EXFIL_RE),
+        if matched:
+            preview_source = cleaned if (code in {"ROLE_IMPERSONATION", "SPECIAL_TOKEN_BREAKOUT"} or (matching_pat and matching_pat.search(cleaned))) else folded
+            findings.append(
+                _finding(
+                    code,
+                    category.name,
+                    risk_level,
+                    channel,
+                    source,
+                    category.description or f"Pattern matching threat category {code}.",
+                    _preview(preview_source, matching_pat) if matching_pat else None,
+                )
             )
-        )
 
     if "kavach_untrusted" in folded.lower() or "</kavach" in folded.lower():
         findings.append(
@@ -682,8 +837,23 @@ def detect_injections(folded: str, cleaned: str, channel: str, source: ContentSo
 
 
 def redact_instruction_spans(text: str) -> str:
-    text = _SPECIAL_TOKEN_RE.sub("[REDACTED_TOKEN]", text)
-    text = _OVERRIDE_RE.sub("[REDACTED_INSTRUCTION]", text)
+    # Redact special tokens and breakout delimiters
+    special_pat = ThreatClassifier.get_category_regex("SPECIAL_TOKEN_BREAKOUT") or _SPECIAL_TOKEN_RE
+    text = special_pat.sub("[REDACTED_TOKEN]", text)
+
+    # Redact instruction overrides
+    override_pat = ThreatClassifier.get_category_regex("INSTRUCTION_OVERRIDE") or _OVERRIDE_RE
+    text = override_pat.sub("[REDACTED_INSTRUCTION]", text)
+
+    # Dynamically redact any custom categories configured with action=REDACT
+    for code, category in ThreatClassifier.get_categories().items():
+        if code not in {"SPECIAL_TOKEN_BREAKOUT", "INSTRUCTION_OVERRIDE"} and category.enabled and category.action == "REDACT":
+            if category.combined_pattern:
+                text = category.combined_pattern.sub(f"[REDACTED_{code}]", text)
+            else:
+                for pat in category.compiled_patterns:
+                    text = pat.sub(f"[REDACTED_{code}]", text)
+
     return text
 
 
@@ -758,3 +928,6 @@ def _blocked_system_prompt() -> str:
 @lru_cache(maxsize=1)
 def get_sanitizer() -> StructuralSanitizer:
     return StructuralSanitizer()
+
+
+

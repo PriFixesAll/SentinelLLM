@@ -19,7 +19,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app import __version__
 from app.schemas.payload import PolicyAction, SanitizeRequest, SanitizeResponse
-from app.services.sanitizer import get_sanitizer
+from app.services.sanitizer import get_pii_masker, get_sanitizer
+from app.services.semantic_guard import get_semantic_guard
 
 logger = logging.getLogger("kavach")
 
@@ -45,6 +46,8 @@ async def lifespan(_app: FastAPI):
     )
     logger.info("Kavach-Proxy %s starting (%s)", __version__, settings.environment)
     get_sanitizer()
+    get_pii_masker()
+    get_semantic_guard()
     yield
     logger.info("Kavach-Proxy shutdown")
 
@@ -152,6 +155,8 @@ async def health() -> dict[str, str]:
 @app.get("/ready", tags=["ops"])
 async def ready() -> dict[str, str]:
     get_sanitizer()
+    get_pii_masker()
+    get_semantic_guard()
     return {"status": "ready"}
 
 
@@ -168,6 +173,14 @@ async def sanitize(payload: SanitizeRequest, request: Request) -> SanitizeRespon
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
+    if result.pii_detected:
+        logger.info(
+            "pii_redacted request_id=%s tenant=%s entities=%s",
+            request_id,
+            payload.tenant_id,
+            result.pii_detected,
+        )
+
     if result.decision.action is PolicyAction.BLOCK:
         logger.warning(
             "blocked request_id=%s tenant=%s score=%s",
@@ -176,6 +189,46 @@ async def sanitize(payload: SanitizeRequest, request: Request) -> SanitizeRespon
             result.decision.score,
         )
     return result
+
+
+@app.post(
+    "/v1/mask-pii",
+    tags=["sanitize"],
+    summary="Directly mask PII entities in an arbitrary text payload",
+)
+async def mask_pii_endpoint(payload: dict[str, str], request: Request) -> dict[str, Any]:
+    text = payload.get("text", "")
+    sanitized_text, stats = get_pii_masker().mask(text)
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+    if stats:
+        logger.info("pii_redacted request_id=%s entities=%s", request_id, stats)
+    return {
+        "request_id": request_id,
+        "sanitized_text": sanitized_text,
+        "pii_detected": stats,
+    }
+
+
+@app.post(
+    "/v1/check-semantic",
+    tags=["sanitize"],
+    summary="Directly evaluate semantic embedding similarity against attack baselines",
+)
+async def check_semantic_endpoint(payload: dict[str, Any], request: Request) -> dict[str, Any]:
+    text = payload.get("text", "")
+    threshold = payload.get("threshold")
+    guard = get_semantic_guard()
+    is_jb, score, matched = guard.check_similarity(text, threshold=threshold)
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+    return {
+        "request_id": request_id,
+        "text": text,
+        "is_jailbreak": is_jb,
+        "similarity_score": score,
+        "matched_baseline": matched,
+        "backend": guard.backend,
+        "threshold": threshold or guard.similarity_threshold,
+    }
 
 
 @app.get("/", tags=["ops"])

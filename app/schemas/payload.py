@@ -143,6 +143,10 @@ class SanitizeOptions(BaseModel):
     max_untrusted_chars: int = Field(default=200_000, ge=256, le=1_048_576)
     include_canary: bool = True
     redact_instruction_spans: bool = True
+    mask_pii: bool = True
+    enable_semantic_guard: bool = True
+    semantic_threshold: float = Field(default=0.72, ge=0.0, le=1.0)
+    force_semantic_check: bool = False
     block_on_critical: bool = True
     preserve_whitespace: bool = True
 
@@ -155,15 +159,59 @@ class SanitizeRequest(BaseModel):
     request_id: Optional[str] = Field(default=None, max_length=128)
     tenant_id: Optional[str] = Field(default=None, max_length=128)
     application_id: Optional[str] = Field(default=None, max_length=128)
-    messages: list[Message] = Field(..., min_length=1, max_length=256)
+    messages: list[Message] = Field(default_factory=list, max_length=256)
     documents: list[ExternalDocument] = Field(default_factory=list, max_length=64)
     tool_results: list[ToolResult] = Field(default_factory=list, max_length=64)
     options: SanitizeOptions = Field(default_factory=SanitizeOptions)
 
+    # Convenience shortcuts for curl & API ergonomics
+    text: Optional[str] = Field(default=None, description="Convenience shortcut: auto-wrapped into a user message")
+    prompt: Optional[str] = Field(default=None, description="Convenience shortcut: auto-wrapped into a user message")
+    mask_pii: Optional[bool] = Field(default=None, description="Convenience shortcut: syncs to options.mask_pii")
+    policy_mode: Optional[PolicyMode] = Field(default=None, description="Convenience shortcut: syncs to options.policy_mode")
+    enable_semantic_guard: Optional[bool] = Field(default=None, description="Convenience shortcut: syncs to options.enable_semantic_guard")
+    force_semantic_check: Optional[bool] = Field(default=None, description="Convenience shortcut: syncs to options.force_semantic_check")
+    semantic_threshold: Optional[float] = Field(default=None, description="Convenience shortcut: syncs to options.semantic_threshold")
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_convenience_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            content = data.get("text") or data.get("prompt")
+            if content and not data.get("messages"):
+                data["messages"] = [{"role": "user", "content": content, "source": "user"}]
+
+            options = data.get("options")
+            if options is None:
+                options = {}
+                data["options"] = options
+            if isinstance(options, dict):
+                if data.get("mask_pii") is not None and "mask_pii" not in options:
+                    options["mask_pii"] = data["mask_pii"]
+                if data.get("policy_mode") is not None and "policy_mode" not in options:
+                    options["policy_mode"] = data["policy_mode"]
+                if data.get("enable_semantic_guard") is not None and "enable_semantic_guard" not in options:
+                    options["enable_semantic_guard"] = data["enable_semantic_guard"]
+                if data.get("force_semantic_check") is not None and "force_semantic_check" not in options:
+                    options["force_semantic_check"] = data["force_semantic_check"]
+                if data.get("semantic_threshold") is not None and "semantic_threshold" not in options:
+                    options["semantic_threshold"] = data["semantic_threshold"]
+        return data
+
     @model_validator(mode="after")
-    def require_at_least_one_content_channel(self) -> "SanitizeRequest":
+    def sync_and_validate_channels(self) -> "SanitizeRequest":
+        if self.mask_pii is not None:
+            self.options.mask_pii = self.mask_pii
+        if self.policy_mode is not None:
+            self.options.policy_mode = self.policy_mode
+        if self.enable_semantic_guard is not None:
+            self.options.enable_semantic_guard = self.enable_semantic_guard
+        if self.force_semantic_check is not None:
+            self.options.force_semantic_check = self.force_semantic_check
+        if self.semantic_threshold is not None:
+            self.options.semantic_threshold = self.semantic_threshold
         if not self.messages and not self.documents and not self.tool_results:
-            raise ValueError("request must include messages, documents, or tool_results")
+            raise ValueError("request must include messages, documents, tool_results, or text/prompt")
         return self
 
 
@@ -219,6 +267,8 @@ class PolicyDecision(BaseModel):
     mode: PolicyMode
     score: int = Field(..., ge=0, le=100)
     reason: str
+    reasons: list[str] = Field(default_factory=list)
+    matches: list[str] = Field(default_factory=list)
 
 
 class SanitizeResponse(BaseModel):
@@ -232,5 +282,7 @@ class SanitizeResponse(BaseModel):
     documents: list[SanitizedDocument]
     assembled: AssembledContext
     canary: Optional[str] = None
+    sanitized_text: Optional[str] = Field(default=None, description="Direct convenience access to primary sanitized text with PII masked")
+    pii_detected: dict[str, int] = Field(default_factory=dict)
     defense_notes: list[str] = Field(default_factory=list)
     diagnostics: dict[str, Any] = Field(default_factory=dict)
