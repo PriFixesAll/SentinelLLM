@@ -213,6 +213,7 @@ def detect_cyrillic_homoglyphs(text: str) -> Optional[dict]:
 
 from app.services.classifier import ThreatClassifier
 from app.services.semantic_guard import get_semantic_guard
+from app.services.intent_analyzer import IntentAnalyzer
 
 # Dynamic regex patterns loaded from external rules configuration with robust fallbacks
 _SPECIAL_TOKEN_RE = (
@@ -528,8 +529,44 @@ class StructuralSanitizer:
                     )
                     primary_clean_text = f"[REDACTED_SEMANTIC_JAILBREAK] {primary_clean_text}"
 
+        intent_decision = None
+        if primary_clean_text:
+            intent_decision = IntentAnalyzer.evaluate(primary_clean_text)
+            if intent_decision.intent == "DEFENSIVE":
+                # False-Positive Mitigation:
+                # If intent is verified defensive/engineering, suppress exploit/bypass findings
+                suppressed_codes = {"EXPLOIT_BYPASS_GENERATION", "INSTRUCTION_OVERRIDE", "SEMANTIC_JAILBREAK"}
+                original_len = len(findings)
+                findings = [f for f in findings if f.code not in suppressed_codes]
+                if len(findings) < original_len or intent_decision.defensive_score > 0:
+                    findings.append(
+                        Finding(
+                            code="DEFENSIVE_ENGINEERING_INTENT",
+                            title="Defensive Engineering Context Verified",
+                            risk=RiskLevel.INFO,
+                            channel="messages[0].user",
+                            source=ContentSource.USER,
+                            detail=intent_decision.reasoning,
+                        )
+                    )
+            elif intent_decision.intent == "MALICIOUS" and not any(f.risk is RiskLevel.CRITICAL for f in findings):
+                findings.append(
+                    Finding(
+                        code="EXPLOIT_BYPASS_GENERATION",
+                        title="Malicious Exploit Intent Detected",
+                        risk=RiskLevel.CRITICAL,
+                        channel="messages[0].user",
+                        source=ContentSource.USER,
+                        detail=intent_decision.reasoning,
+                    )
+                )
+
         decision = self._decide(findings, options)
         if decision.action is PolicyAction.BLOCK:
+            blocked_refusal = (
+                "REQUEST_BLOCKED_BY_KAVACH_GATEWAY: Security policy violation detected. "
+                "Malicious exploit generation or unauthorized security bypass request blocked."
+            )
             assembled = AssembledContext(
                 system=_blocked_system_prompt(),
                 trusted_instructions="\n\n".join(trusted_parts),
@@ -552,7 +589,7 @@ class StructuralSanitizer:
                 documents=[],
                 assembled=assembled,
                 canary=canary,
-                sanitized_text=primary_clean_text,
+                sanitized_text=blocked_refusal,
                 pii_detected=total_pii,
                 defense_notes=self._defense_notes(options, boundary),
                 diagnostics={"boundary_prefix": boundary[:6], "blocked": True, "pii_detected": total_pii},

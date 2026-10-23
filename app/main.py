@@ -20,6 +20,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from app import __version__
 from app.schemas.payload import PolicyAction, SanitizeRequest, SanitizeResponse, ValidateResponseRequest, ValidateResponseResult
 from app.services.sanitizer import get_pii_masker, get_sanitizer, validate_llm_response
+from app.services.intent_analyzer import IntentAnalyzer
 from app.services.semantic_guard import get_semantic_guard
 
 logger = logging.getLogger("kavach")
@@ -252,6 +253,28 @@ async def validate_response_endpoint(payload: ValidateResponseRequest, request: 
             result.details,
         )
     return result
+
+
+@app.post(
+    "/v1/analyze-intent",
+    tags=["sanitize"],
+    summary="Evaluate prompt intent and context to distinguish offensive exploits from defensive engineering",
+)
+async def analyze_intent_endpoint(payload: dict[str, str], request: Request) -> dict[str, Any]:
+    text = payload.get("text", "")
+    decision = IntentAnalyzer.evaluate(text)
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+    return {
+        "request_id": request_id,
+        "prompt": text,
+        "status": decision.status,
+        "intent": decision.intent,
+        "category": decision.category,
+        "confidence_score": decision.confidence_score,
+        "reasoning": decision.reasoning,
+        "defensive_score": decision.defensive_score,
+        "offensive_score": decision.offensive_score,
+    }
 
 
 @app.get("/", tags=["ops"])
