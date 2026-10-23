@@ -18,8 +18,8 @@ from pydantic import ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app import __version__
-from app.schemas.payload import PolicyAction, SanitizeRequest, SanitizeResponse
-from app.services.sanitizer import get_pii_masker, get_sanitizer
+from app.schemas.payload import PolicyAction, SanitizeRequest, SanitizeResponse, ValidateResponseRequest, ValidateResponseResult
+from app.services.sanitizer import get_pii_masker, get_sanitizer, validate_llm_response
 from app.services.semantic_guard import get_semantic_guard
 
 logger = logging.getLogger("kavach")
@@ -229,6 +229,29 @@ async def check_semantic_endpoint(payload: dict[str, Any], request: Request) -> 
         "backend": guard.backend,
         "threshold": threshold or guard.similarity_threshold,
     }
+
+
+@app.post(
+    "/v1/validate-response",
+    response_model=ValidateResponseResult,
+    tags=["validate"],
+    summary="Validate outbound LLM response against Canary leakage, prompt extraction, and PII",
+)
+async def validate_response_endpoint(payload: ValidateResponseRequest, request: Request) -> ValidateResponseResult:
+    result = validate_llm_response(
+        response_text=payload.response_text,
+        canary=payload.canary,
+        mask_pii=payload.mask_pii,
+        check_prompt_leak=payload.check_prompt_leak,
+    )
+    if not result.is_safe:
+        logger.warning(
+            "outbound_leak_detected canary_leaked=%s prompt_leaked=%s details=%s",
+            result.canary_leaked,
+            result.prompt_leaked,
+            result.details,
+        )
+    return result
 
 
 @app.get("/", tags=["ops"])
